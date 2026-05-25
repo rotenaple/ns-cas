@@ -1,0 +1,35 @@
+services:
+  cas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ns-cas:${TAG:-latest}
+    container_name: ns-cas
+    ports:
+      - "${CAS_PORT:-8080}:8080"
+    networks:
+      - cas_internal
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+    environment:
+      CAS_PORT: "8080"
+      CAS_DB_PATH: "/data/cas.db"
+      CAS_AGING_WEIGHT: "${CAS_AGING_WEIGHT:-1.0}"
+      CAS_MAX_QUEUE: "${CAS_MAX_QUEUE:-100}"
+    restart: unless-stopped
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/cas-healthcheck"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  cas_internal:
+    driver: bridge

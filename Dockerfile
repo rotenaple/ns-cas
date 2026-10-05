@@ -52,10 +52,19 @@ EXPOSE 8080
 STOPSIGNAL SIGTERM
 
 # Environment variable defaults (all overridable via docker run / Compose)
+# The rate-limit values are cold-start fallbacks only: CAS runs on the
+# ratelimit-limit / ratelimit-policy / ratelimit-remaining headers, and on the
+# Retry-After NS reports for a 429.
 ENV CAS_PORT=8080 \
     CAS_DB_PATH=/data/cas.db \
     CAS_AGING_WEIGHT=1.0 \
-    CAS_MAX_QUEUE=100
+    CAS_MAX_QUEUE=100 \
+    CAS_BUCKET_LIMIT=50 \
+    CAS_POLICY_WINDOW_SEC=30 \
+    CAS_SUSTAINED_LIMIT=300 \
+    CAS_SUSTAINED_WINDOW_SEC=900 \
+    CAS_SUSTAINED_MIN_LIMIT=25 \
+    CAS_SUSTAINED_MAX_LIMIT=1200
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/cas-healthcheck"]

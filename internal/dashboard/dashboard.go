@@ -70,9 +70,10 @@ func (h *dashHandler) buildLiveState() liveStateJSON {
 			remaining = 0
 		}
 		windowDisplay = fmt.Sprintf("%ds", int(remaining.Seconds()))
-		if h.state.WindowDetectedVia == "49_trigger" {
-			windowAccuracy = "high"
-		}
+		// The window shown here is how long the reported ratelimit-remaining stays
+		// trustworthy, taken from ratelimit-policy's w=. It comes from NS, so it is
+		// worth saying so — a CAS-invented window would not be.
+		windowAccuracy = "ns"
 	} else {
 		windowDisplay = "N/A"
 	}
@@ -353,7 +354,7 @@ th{padding:2px 3px;font-size:.62rem}td{padding:2px 3px;font-size:.62rem;white-sp
   <div class="live-grid">
     <div class="live-item" data-field="window">
       <div class="v {{if eq .WindowDisplay "—"}}status-warn{{else if eq .WindowDisplay "N/A"}}status-warn{{else}}status-ok{{end}}">{{if .WindowEndUnix}}<span data-window-end="{{.WindowEndUnix}}">{{.WindowDisplay}}</span>{{else}}{{.WindowDisplay}}{{end}}</div>
-      <div class="k">Window remaining{{if eq .WindowAccuracy "high"}} <span class="tag acc-high">⬤ high accuracy</span>{{end}}</div>
+      <div class="k">Window remaining{{if eq .WindowAccuracy "ns"}} <span class="tag acc-high">⬤ from NS</span>{{end}}</div>
     </div>
     <div class="live-item" data-field="available">
       <div class="v {{if gt .Available 0}}status-ok{{else}}status-err{{end}}">{{.Available}}</div>
@@ -485,6 +486,8 @@ th{padding:2px 3px;font-size:.62rem}td{padding:2px 3px;font-size:.62rem;white-sp
       <td style="color:var(--muted)" data-time="{{.LoggedAt}}">{{.ID}}</td>
       <td>
         {{if eq .DetectedVia "49_trigger"}}<span class="tag det-primary">49-trigger</span>
+        {{else if eq .DetectedVia "ns_headers"}}<span class="tag det-primary">ns-headers</span>
+        {{else if eq .DetectedVia "cas_window"}}<span class="tag det-fallback">cas-window</span>
         {{else}}<span class="tag det-fallback">fallback</span>{{end}}
       </td>
       <td>{{shortTime .WindowStart}}</td>
@@ -539,7 +542,7 @@ var wi=document.querySelector('[data-field="window"]');if(wi){var v=wi.querySele
 if(d.windowEndUnix>0){var s=v.querySelector('[data-window-end]');if(!s){v.innerHTML='';s=document.createElement('span');v.appendChild(s)}
 s.setAttribute('data-window-end',d.windowEndUnix)}else{v.innerHTML=d.windowDisplay}
 v.className='v '+(d.windowDisplay==='—'||d.windowDisplay==='N/A'?'status-warn':'status-ok')
-k.innerHTML='Window remaining'+(d.windowAccuracy==='high'?' <span class="tag acc-high">⬤ high accuracy</span>':'')}
+  k.innerHTML='Window remaining'+(d.windowAccuracy==='ns'?' <span class="tag acc-high">⬤ from NS</span>':'')}
 var f=function(k){return document.querySelector('[data-field="'+k+'"] .v')}
 var av=f('available');if(av){av.textContent=d.available;av.className='v '+(d.available>0?'status-ok':'status-err')}
 var re=f('remaining');if(re)re.textContent=d.remaining

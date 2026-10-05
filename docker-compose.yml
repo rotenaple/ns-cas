@@ -16,6 +16,17 @@ services:
       CAS_DB_PATH: "/data/cas.db"
       CAS_AGING_WEIGHT: "${CAS_AGING_WEIGHT:-1.0}"
       CAS_MAX_QUEUE: "${CAS_MAX_QUEUE:-100}"
+      # Cold-start fallbacks only. CAS runs on the rate-limit headers NationStates
+      # returns (ratelimit-limit, ratelimit-policy, ratelimit-remaining) and on
+      # Retry-After for penalties, so these apply until the first report arrives.
+      # SustainedWindowSec is superseded by the penalty duration NS actually
+      # reports; SustainedMin/Max bound how far the adaptive allowance may move.
+      CAS_BUCKET_LIMIT: "${CAS_BUCKET_LIMIT:-50}"
+      CAS_POLICY_WINDOW_SEC: "${CAS_POLICY_WINDOW_SEC:-30}"
+      CAS_SUSTAINED_LIMIT: "${CAS_SUSTAINED_LIMIT:-300}"
+      CAS_SUSTAINED_WINDOW_SEC: "${CAS_SUSTAINED_WINDOW_SEC:-900}"
+      CAS_SUSTAINED_MIN_LIMIT: "${CAS_SUSTAINED_MIN_LIMIT:-25}"
+      CAS_SUSTAINED_MAX_LIMIT: "${CAS_SUSTAINED_MAX_LIMIT:-1200}"
     restart: unless-stopped
     stop_grace_period: 15s
     healthcheck:

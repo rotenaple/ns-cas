@@ -61,12 +61,15 @@ behind the current one. CAS uses `1 + backlog` to weight demand for [class quota
   "ns_remaining": 47,
   "ns_reset": 27,
   "ns_rate_limit": 50,
+  "ns_policy": "50;w=30",
   "status_code": 200,
   "retry_after": 0
 }
 ```
 
 All timestamps are RFC 3339. `retry_after` is only non-zero when `status_code = 429`.
+`ns_policy` is the `ratelimit-policy` header verbatim; send it, because it is the only
+header that says how long an allocation lasts.
 
 For `/report-and-acquire`, include `next_priority_class` (the class of the next request) and
 optionally `backlog` (same semantics as `/acquire`).
@@ -140,17 +143,71 @@ acquire call, so an appliance with 9 requests waiting signals 10 units, not 1.
 | `CAS_DB_PATH` | `/data/cas.db` | SQLite database path |
 | `CAS_AGING_WEIGHT` | `1.0` | Starvation prevention: rate at which low-priority tickets age into higher priority |
 | `CAS_MAX_QUEUE` | `100` | Max long-poll connections before returning 503 |
+| `CAS_BUCKET_LIMIT` | `50` | Fallback burst allowance, used until `ratelimit-limit` arrives |
+| `CAS_POLICY_WINDOW_SEC` | `30` | Fallback for the `w=` component of `ratelimit-policy` |
+| `CAS_SUSTAINED_LIMIT` | `300` | Initial dispatches allowed per sustained window |
+| `CAS_SUSTAINED_WINDOW_SEC` | `900` | Initial sustained window length; superseded by the `Retry-After` NS reports |
+| `CAS_SUSTAINED_MIN_LIMIT` | `25` | Floor the sustained allowance is cut down to by penalties |
+| `CAS_SUSTAINED_MAX_LIMIT` | `1200` | Ceiling the sustained allowance climbs back to |
+
+---
+
+## Rate limiting: what CAS runs on
+
+CAS does not model NationStates' quota. It runs on the headers NS returns, in
+both normal operation and penalty:
+
+| Header | Use |
+|--------|-----|
+| `ratelimit-limit` | The allowance (`BucketLimit`) |
+| `ratelimit-policy` | `50;w=30` — the only header that states how long an allocation lasts. Its `w=` is how long a reported remaining stays trustworthy |
+| `ratelimit-remaining` | The budget actually left, which is what gates dispatch |
+| `ratelimit-reset` | Countdown to the next refill. **Not** a window length |
+| `Retry-After` (on 429) | Penalty duration, which becomes the sustained window |
+
+The env vars above are cold-start and fallback only. `ratelimit-reset` is
+deliberately not used as a window length: doing so grants a fresh allowance
+several times faster than NS resets its own, which is what produced the
+sustained 429s CAS is meant to prevent.
+
+### Two budgets
+
+**Burst** — `ratelimit-remaining` is authoritative. CAS dispatches only while
+`remaining − in_flight > 0`. Once a reported figure is older than the policy
+window it is discarded and the bucket is assumed refilled, because a stale `0`
+would otherwise wedge CAS: the value only clears when a report arrives, and if
+the budget is what stopped dispatch then no report is coming.
+
+**Sustained** — NationStates also enforces a longer-run limit whose penalty
+duration it reports per occurrence. CAS caps dispatches across that window, and
+the window length is learned from `Retry-After` rather than assumed, since the
+duration varies.
+
+The sustained allowance adapts, because the limit NS enforces is not published:
+
+- a 429 **halves** it — direct evidence the rate was too high — clamped to `CAS_SUSTAINED_MIN_LIMIT`
+- a sustained window that completes without a 429 **adds one** back, up to `CAS_SUSTAINED_MAX_LIMIT`
+- a window containing a penalty earns nothing back
+
+Every change is logged with the old and new values, and `/status` reports the
+live allowance against the configured baseline.
+
+A 429 with no `Retry-After` keeps the window already learned rather than
+collapsing the penalty to zero. Collapsing it released dispatch immediately and
+walked straight back into another 429.
 
 ---
 
 ## Features
 
-- **Zero-429 enforcement** — never dispatches when `LocalRemaining - InFlight ≤ 0`
+- **Zero-429 enforcement** — never dispatches when `ratelimit-remaining − in_flight ≤ 0`
+- **Header-driven quota** — allowance, window length and budget all come from `ratelimit-limit` / `ratelimit-policy` / `ratelimit-remaining`, never from a local model
+- **Sustained budget** — caps dispatches across the penalty window, whose length is learned from the `Retry-After` NS reports; the allowance halves on a 429 and recovers one request per clean window
 - **Class-based quota allocation** — at each window boundary, slots are divided across `P1_HIGH / P2_MEDIUM / P3_LOW` proportionally by demand with configurable hard ceilings; a shared spill pool absorbs unused budget
 - **Priority scheduling** — `P1_HIGH` / `P2_MEDIUM` / `P3_LOW` with aging-based starvation prevention
 - **Cold-start safety** — boots with `LocalRemaining = 1` until first telemetry calibrates state
-- **30-second window tracking** — detects NS window boundaries via the 49-trigger with fallback on `RateLimit-Reset`
-- **Hard lockdown on 429** — blocks all dispatch; resumes with half-bucket after `Retry-After`
+- **Stale-figure recovery** — a reported remaining older than the policy window is discarded rather than allowed to wedge dispatch
+- **Hard lockdown on 429** — blocks all dispatch for the reported penalty duration; resumes at full allowance afterwards
 - **Stale ticket reaper** — expired tickets (>10 s) reclaimed so crashed appliances never leak in-flight slots
 - **Legacy interference measurement** — quantifies quota consumed by uncoordinated scripts between dispatch and response
 - **Live dashboard** — auto-refreshing dark UI at `/dashboard`

@@ -27,6 +27,7 @@ type Report struct {
 	NSRemaining       int       `json:"ns_remaining"`
 	NSReset           int       `json:"ns_reset"`
 	NSRateLimit       int       `json:"ns_rate_limit"`
+	NSPolicy          string    `json:"ns_policy,omitempty"` // ratelimit-policy, e.g. "50;w=30"
 	StatusCode        int       `json:"status_code"`
 	RetryAfter        int       `json:"retry_after"`
 }
@@ -73,6 +74,33 @@ func (e *Engine) notify() {
 	case e.notifyChan <- struct{}{}:
 	default:
 	}
+}
+
+// ---- analytics ----
+//
+// Telemetry must never be able to fail a dispatch, so each write is fire-and-
+// forget and tolerates a missing database. That also lets the quota logic be
+// tested without one: go-sqlite3 needs cgo, which not every environment has.
+
+func (e *Engine) recordLog(entry db.LogEntry) {
+	if e.DB == nil {
+		return
+	}
+	go e.DB.WriteLog(entry)
+}
+
+func (e *Engine) recordWindow(entry db.WindowEntry) {
+	if e.DB == nil {
+		return
+	}
+	go e.DB.WriteWindow(entry)
+}
+
+func (e *Engine) recordAnomaly(eventType, applianceID, token, detail string) {
+	if e.DB == nil {
+		return
+	}
+	go e.DB.WriteAnomaly(eventType, applianceID, token, detail)
 }
 
 // ---- Acquire ----
@@ -122,10 +150,11 @@ func (e *Engine) TryAcquire(req AcquireRequest) (token string, ch chan bool, cod
 			IssuedAt:    time.Now(),
 		}
 		e.State.InFlight++
+		e.State.DeductSustained()
 		ticket.ExpectedRemaining = e.State.LocalRemaining - e.State.InFlight
 		e.State.ActiveTickets[req.ApplianceID] = ticket
-		log.Printf("[acquire] immediate grant appliance=%s token=%s in_flight=%d remaining=%d",
-			req.ApplianceID, tok, e.State.InFlight, e.State.LocalRemaining)
+		log.Printf("[acquire] immediate grant appliance=%s token=%s in_flight=%d remaining=%d sustained=%d/%d",
+			req.ApplianceID, tok, e.State.InFlight, e.State.LocalRemaining, e.State.SustainedUsed, e.State.SustainedLimit)
 		e.Notifier.Notify()
 		return tok, nil, 0
 	}
@@ -160,10 +189,11 @@ func (e *Engine) GrantFromQueue(item *queue.Item) string {
 		IssuedAt:    time.Now(),
 	}
 	e.State.InFlight++
+	e.State.DeductSustained()
 	ticket.ExpectedRemaining = e.State.LocalRemaining - e.State.InFlight
 	e.State.ActiveTickets[item.ApplianceID] = ticket
-	log.Printf("[dispatch] grant appliance=%s token=%s in_flight=%d remaining=%d",
-		item.ApplianceID, tok, e.State.InFlight, e.State.LocalRemaining)
+	log.Printf("[dispatch] grant appliance=%s token=%s in_flight=%d remaining=%d sustained=%d/%d",
+		item.ApplianceID, tok, e.State.InFlight, e.State.LocalRemaining, e.State.SustainedUsed, e.State.SustainedLimit)
 	return tok
 }
 
@@ -190,7 +220,7 @@ func (e *Engine) processReportUnderLock(r Report) reportResult {
 	if !ok || ticket.Token != r.Token {
 		e.State.Unlock()
 		log.Printf("[report] anomaly: unmatched token appliance=%s token=%s", r.ApplianceID, r.Token)
-		go e.DB.WriteAnomaly("unmatched_token", r.ApplianceID, r.Token,
+		e.recordAnomaly("unmatched_token", r.ApplianceID, r.Token,
 			fmt.Sprintf("known_token=%v", func() string {
 				if ticket != nil {
 					return ticket.Token
@@ -214,10 +244,18 @@ func (e *Engine) processReportUnderLock(r Report) reportResult {
 	}
 
 	if r.StatusCode == 429 {
-		e.State.LockdownActive = true
-		e.State.LockdownUntil = time.Now().Add(time.Duration(r.RetryAfter) * time.Second)
-		e.State.LocalRemaining = 0
-		log.Printf("[report] 429 lockdown for %ds", r.RetryAfter)
+		// A 429 still carries the rate-limit headers, so fold them in before
+		// serving the penalty: NS reports how long the penalty lasts, and that
+		// duration drives the sustained window rather than a configured
+		// assumption. A missing or zero Retry-After keeps the window CAS has
+		// already learned instead of collapsing the penalty to nothing, which is
+		// what previously turned a 429 into an immediate half-bucket re-dispatch
+		// and then another 429.
+		e.State.NoteHeaders(e.headersFrom(r), r.APIRecvAt)
+		p := e.State.NotePenalty(r.RetryAfter)
+		log.Printf("[report] penalty appliance=%s: window %ds->%ds sustained_limit %d->%d until=%s penalties_total=%d",
+			r.ApplianceID, p.OldWindowSec, p.NewWindowSec,
+			p.OldLimit, p.NewLimit, p.Until.Format(time.RFC3339), e.State.Penalties)
 		snapTicket := *ticket
 		return reportResult{
 			ok:         true,
@@ -234,14 +272,7 @@ func (e *Engine) processReportUnderLock(r Report) reportResult {
 		log.Printf("[report] legacy usage detected: implied=%d appliance=%s", impliedLegacy, r.ApplianceID)
 	}
 
-	if r.NSRemaining < e.State.LocalRemaining {
-		e.State.LocalRemaining = r.NSRemaining
-	}
-
-	windowDetected := e.tryPrimaryWindowDetection(r)
-	if !windowDetected {
-		e.tryFallbackWindowDetection(r)
-	}
+	e.observeQuota(r)
 
 	snapTicket := *ticket
 	return reportResult{
@@ -251,6 +282,15 @@ func (e *Engine) processReportUnderLock(r Report) reportResult {
 	}
 }
 
+// headersFrom lifts the rate-limit headers out of a report.
+func (e *Engine) headersFrom(r Report) state.Headers {
+	return state.Headers{
+		Limit:     r.NSRateLimit,
+		Policy:    r.NSPolicy,
+		Remaining: r.NSRemaining,
+		ResetSec:  r.NSReset,
+	}
+}
 // ---- dispatchLoop ----
 
 // dispatchLoop drains the priority queue whenever state changes are signalled.
@@ -329,7 +369,7 @@ func (e *Engine) HandleReport(r Report) {
 		return
 	}
 	e.State.Unlock()
-	go e.DB.WriteLog(res.logEntry)
+	e.recordLog(res.logEntry)
 	e.notify()
 	e.Notifier.Notify()
 }
@@ -349,7 +389,7 @@ func (e *Engine) TryReportAndAcquire(r Report) (token string, ch chan bool, code
 	}
 	if res.isLockdown {
 		e.State.Unlock()
-		go e.DB.WriteLog(res.logEntry)
+		e.recordLog(res.logEntry)
 		e.notify()
 		e.Notifier.Notify()
 		return "", nil, 429
@@ -371,12 +411,13 @@ func (e *Engine) TryReportAndAcquire(r Report) (token string, ch chan bool, code
 			IssuedAt:    time.Now(),
 		}
 		e.State.InFlight++
+		e.State.DeductSustained()
 		ticket.ExpectedRemaining = e.State.LocalRemaining - e.State.InFlight
 		e.State.ActiveTickets[r.ApplianceID] = ticket
-		log.Printf("[acquire] immediate grant (combined) appliance=%s token=%s in_flight=%d remaining=%d",
-			r.ApplianceID, tok, e.State.InFlight, e.State.LocalRemaining)
+		log.Printf("[acquire] immediate grant (combined) appliance=%s token=%s in_flight=%d remaining=%d sustained=%d/%d",
+			r.ApplianceID, tok, e.State.InFlight, e.State.LocalRemaining, e.State.SustainedUsed, e.State.SustainedLimit)
 		e.State.Unlock()
-		go e.DB.WriteLog(res.logEntry)
+		e.recordLog(res.logEntry)
 		e.notify()
 		e.Notifier.Notify()
 		return tok, nil, 0
@@ -384,7 +425,7 @@ func (e *Engine) TryReportAndAcquire(r Report) (token string, ch chan bool, code
 
 	if e.Queue.Len() >= e.MaxQueue {
 		e.State.Unlock()
-		go e.DB.WriteLog(res.logEntry)
+		e.recordLog(res.logEntry)
 		e.notify()
 		e.Notifier.Notify()
 		return "", nil, 503
@@ -406,7 +447,7 @@ func (e *Engine) TryReportAndAcquire(r Report) (token string, ch chan bool, code
 	log.Printf("[acquire] queued (combined) appliance=%s priority=%s queue_depth=%d",
 		r.ApplianceID, r.NextPriorityClass, e.Queue.Len())
 	e.State.Unlock()
-	go e.DB.WriteLog(res.logEntry)
+	e.recordLog(res.logEntry)
 	e.notify()
 	e.Notifier.Notify()
 	return "", ch, 0
@@ -434,47 +475,42 @@ func buildEntry(r Report, ticket state.ActiveTicket, impliedLegacy int) db.LogEn
 	}
 }
 
-// ---- Window detection (called with state.Lock held) ----
+// ---- Quota observation (called with state.Lock held) ----
 
-func (e *Engine) tryPrimaryWindowDetection(r Report) bool {
-	if r.NSRemaining != 49 || e.State.WindowActive {
-		return false
-	}
-	oneWay := r.APIRecvAt.Sub(r.APISentAt) / 2
-	e.State.WindowStartTime = r.APIRecvAt.Add(-oneWay)
-	e.State.WindowEndTime = e.State.WindowStartTime.Add(30 * time.Second)
-	e.State.WindowActive = true
-	e.State.WindowDetectedVia = "49_trigger"
-	log.Printf("[window] primary (49-trigger) start=%s end=%s",
-		e.State.WindowStartTime.Format(time.RFC3339Nano),
-		e.State.WindowEndTime.Format(time.RFC3339Nano))
-	go e.DB.WriteWindow(db.WindowEntry{
-		WindowStart:  e.State.WindowStartTime,
-		WindowEnd:    e.State.WindowEndTime,
-		DetectedVia:  "49_trigger",
-		TriggerToken: r.Token,
-	})
-	return true
-}
+// observeQuota folds the rate-limit headers into state and records what they say
+// about CAS's own model.
+//
+// CAS runs on what NationStates reports rather than on a window it infers for
+// itself: ratelimit-limit is the allowance, ratelimit-policy's w= is how long a
+// reported remaining stays trustworthy, and ratelimit-remaining is the budget
+// left. What the headers cannot tell CAS is why its view and NS's disagree, so
+// the disagreement is recorded rather than guessed at.
+// Called with state.Lock held.
+func (e *Engine) observeQuota(r Report) {
+	casRemaining := e.State.LocalRemaining
 
-func (e *Engine) tryFallbackWindowDetection(r Report) bool {
-	if e.State.WindowActive {
-		return false
+	e.State.NoteHeaders(e.headersFrom(r), r.APIRecvAt)
+
+	if e.State.ConsumeWindowOpened() {
+		e.recordWindow(db.WindowEntry{
+			WindowStart:  e.State.WindowStartTime,
+			WindowEnd:    e.State.WindowEndTime,
+			DetectedVia:  "ns_headers",
+			TriggerToken: r.Token,
+		})
 	}
-	e.State.WindowEndTime = r.APIRecvAt.Add(time.Duration(r.NSReset) * time.Second)
-	e.State.WindowStartTime = e.State.WindowEndTime.Add(-30 * time.Second)
-	e.State.WindowActive = true
-	e.State.WindowDetectedVia = "reset_fallback"
-	log.Printf("[window] fallback (reset_fallback) start=%s end=%s",
-		e.State.WindowStartTime.Format(time.RFC3339Nano),
-		e.State.WindowEndTime.Format(time.RFC3339Nano))
-	go e.DB.WriteWindow(db.WindowEntry{
-		WindowStart:  e.State.WindowStartTime,
-		WindowEnd:    e.State.WindowEndTime,
-		DetectedVia:  "reset_fallback",
-		TriggerToken: r.Token,
-	})
-	return true
+
+	// NS reporting an empty budget while CAS still believes it holds some means
+	// the sustained allowance is too generous, or something outside CAS spent the
+	// quota. Either way it is worth seeing, because it is the only signal that the
+	// limit CAS is enforcing does not match the limit NS is enforcing.
+	if r.NSRemaining == 0 && casRemaining > 0 {
+		e.recordAnomaly("ns_exhausted", r.ApplianceID, r.Token, fmt.Sprintf(
+			"cas_remaining=%d policy_window_sec=%d sustained_used=%d sustained_limit=%d sustained_window_sec=%d",
+			casRemaining, e.State.PolicyWindow(), e.State.SustainedUsed, e.State.SustainedLimit, e.State.SustainedWindowSec))
+		log.Printf("[report] NS out of budget while cas held %d (policy_window=%ds sustained=%d/%d) appliance=%s",
+			casRemaining, e.State.PolicyWindow(), e.State.SustainedUsed, e.State.SustainedLimit, r.ApplianceID)
+	}
 }
 
 // ---- Stale ticket reaper ----
@@ -490,7 +526,7 @@ func (e *Engine) ticketReaper() {
 				log.Printf("[reaper] expired ticket appliance=%s token=%s age=%s",
 					applianceID, ticket.Token, now.Sub(ticket.IssuedAt))
 				snapTicket := *ticket
-				go e.DB.WriteAnomaly("ticket_expired", snapTicket.ApplianceID, snapTicket.Token,
+				e.recordAnomaly("ticket_expired", snapTicket.ApplianceID, snapTicket.Token,
 					fmt.Sprintf("age_ms=%d", now.Sub(snapTicket.IssuedAt).Milliseconds()))
 				delete(e.State.ActiveTickets, applianceID)
 				e.State.InFlight--

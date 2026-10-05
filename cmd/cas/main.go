@@ -29,8 +29,27 @@ func main() {
 	certFile := os.Getenv("CAS_CERT_FILE")
 	keyFile := os.Getenv("CAS_KEY_FILE")
 
+	// Burst and sustained limits. NationStates publishes both as headers —
+	// ratelimit-limit, ratelimit-policy ("50;w=30"), ratelimit-remaining,
+	// ratelimit-reset, and Retry-After on a 429 — and CAS runs on those. The
+	// values here are only cold-start and fallback: PolicyWindowSec applies until
+	// a policy header arrives, and SustainedWindowSec until the first 429 reports
+	// a real penalty duration.
+	defaults := state.DefaultConfig()
+	cfg := state.Config{
+		BucketLimit:        envInt("CAS_BUCKET_LIMIT", defaults.BucketLimit),
+		PolicyWindowSec:    envInt("CAS_POLICY_WINDOW_SEC", defaults.PolicyWindowSec),
+		SustainedLimit:     envInt("CAS_SUSTAINED_LIMIT", defaults.SustainedLimit),
+		SustainedWindowSec: envInt("CAS_SUSTAINED_WINDOW_SEC", defaults.SustainedWindowSec),
+		SustainedMinLimit:  envInt("CAS_SUSTAINED_MIN_LIMIT", defaults.SustainedMinLimit),
+		SustainedMaxLimit:  envInt("CAS_SUSTAINED_MAX_LIMIT", defaults.SustainedMaxLimit),
+	}
+
 	log.Printf("[cas] starting — port=%s db=%s aging_weight=%.2f max_queue=%d",
 		port, dbPath, agingW, maxQueue)
+	log.Printf("[cas] fallback limits — burst=%d policy_window=%ds sustained=%d/%ds sustained_bounds=[%d,%d] (headers override)",
+		cfg.BucketLimit, cfg.PolicyWindowSec, cfg.SustainedLimit, cfg.SustainedWindowSec,
+		cfg.SustainedMinLimit, cfg.SustainedMaxLimit)
 
 	// ---- Database ----
 	database, err := db.Open(dbPath)
@@ -40,7 +59,7 @@ func main() {
 	defer database.Close()
 
 	// ---- State + Queue ----
-	st := state.New()
+	st := state.New(cfg)
 	q := queue.New(agingW)
 
 	// ---- Engine (launches background goroutines) ----

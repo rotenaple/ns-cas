@@ -184,7 +184,19 @@ type statusResponse struct {
 	LockdownUntil   *string `json:"lockdown_until,omitempty"`
 	WindowActive    bool    `json:"window_active"`
 	WindowEndTime   *string `json:"window_end_time,omitempty"`
+	PolicyWindowSec int     `json:"policy_window_sec"`
 	ActiveAppliances []string `json:"active_appliances"`
+
+	// Sustained budget. SustainedLimit is the live value: a 429 halves it and a
+	// clean window adds one back, so SustainedBaseline is what it recovers
+	// towards. Penalties is the lifetime 429 count.
+	SustainedLimit     int `json:"sustained_limit"`
+	SustainedBaseline  int `json:"sustained_baseline"`
+	SustainedUsed      int `json:"sustained_used"`
+	SustainedRemaining int `json:"sustained_remaining"`
+	SustainedWindowSec int `json:"sustained_window_sec"`
+	SustainedWindowEnd *string `json:"sustained_window_end,omitempty"`
+	Penalties          int `json:"penalties"`
 }
 
 func (e *Engine) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -201,6 +213,13 @@ func (e *Engine) handleStatus(w http.ResponseWriter, r *http.Request) {
 		avail = 0
 	}
 
+	sustainedRemaining := e.State.SustainedLimit - e.State.SustainedUsed
+	if sustainedRemaining < 0 {
+		sustainedRemaining = 0
+	}
+
+	cfg := e.State.Config()
+
 	resp := statusResponse{
 		Calibrated:     e.State.Calibrated,
 		BucketLimit:    e.State.BucketLimit,
@@ -210,6 +229,14 @@ func (e *Engine) handleStatus(w http.ResponseWriter, r *http.Request) {
 		QueueDepth:     e.Queue.Len(),
 		LockdownActive: e.State.LockdownActive,
 		WindowActive:   e.State.WindowActive,
+		PolicyWindowSec: e.State.PolicyWindow(),
+
+		SustainedLimit:     e.State.SustainedLimit,
+		SustainedBaseline:  cfg.SustainedLimit,
+		SustainedUsed:      e.State.SustainedUsed,
+		SustainedRemaining: sustainedRemaining,
+		SustainedWindowSec: e.State.SustainedWindowSec,
+		Penalties:          e.State.Penalties,
 	}
 
 	if e.State.LockdownActive {
@@ -219,6 +246,10 @@ func (e *Engine) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if e.State.WindowActive {
 		s := e.State.WindowEndTime.UTC().Format(time.RFC3339)
 		resp.WindowEndTime = &s
+	}
+	if !e.State.SustainedWindowEnd.IsZero() {
+		s := e.State.SustainedWindowEnd.UTC().Format(time.RFC3339)
+		resp.SustainedWindowEnd = &s
 	}
 
 	for appID := range e.State.ActiveTickets {
